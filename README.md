@@ -69,6 +69,12 @@ Early design phase — decisions below are being made and documented as the proj
     - `SLT.ORGCARB` (organic carbon %) — redundant with `SNT.KIND` (mineral vs. organic) at the resolution the profile needs.
     - Kept from SLT: `BD` (bulk density — bearing-capacity proxy), texture % (sand/silt/clay — cohesion/frost/liquefaction behavior), `KSAT` (how long soil stays weak after rain, a natural join point with climate/precipitation data later). Chose to keep the full layer table over collapsing to `DRAINAGE` class alone because we have no real pole-failure data to calibrate against — continuous physical values are more defensible to derive formula weights from via published geotechnical bearing-capacity relationships than assigning arbitrary weights to someone else's categorical judgment calls.
 
+- **First API endpoint: `GET /viability?lat=<n>&lng=<n>`** (`src/viability/`) — the public entry point for pole viability lookups, and the one URL the outside world will call. For now it's a thin pass-through to `SoilService.getSoilRiskProfile` (no combined score yet — that comes once climate data and the scoring formula exist). The response shape here is expected to change once soil becomes one input among several rather than the whole response.
+  - Only `lat`/`lng` are accepted right now — city-name input needs geocoding, which isn't built (see open questions).
+  - Query params are validated with `class-validator`'s `@IsLatitude`/`@IsLongitude` (via a global `ValidationPipe` in `main.ts`, `transform: true` so query strings coerce to numbers first). Missing or out-of-range coordinates get a `400` with a clear message before ever reaching `SoilService` — no manual bounds-checking needed in the controller.
+  - A location outside SLC coverage (e.g. open ocean) is a normal `200` with `dataAvailable: false`, not an error — it's a valid answer ("no data here"), not a failure.
+  - Verified live: started the app and curled the endpoint directly (not just through tests) for the golden path (Regina, SK), missing params, an out-of-range latitude, and an ocean point — all behaved as above.
+
 ## Open questions
 
 - What specific risk factors go into the formula (wind speed/gusts, soil moisture, soil type/bearing capacity, freeze-thaw, precipitation, storm frequency, etc.)?
