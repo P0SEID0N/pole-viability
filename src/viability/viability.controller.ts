@@ -1,22 +1,26 @@
 import { Controller, Get, Query } from '@nestjs/common';
-import { SoilService } from '../soil/soil.service';
+import { PoleViabilityService } from './pole-viability.service';
 import { GetViabilityQueryDto } from './dto/get-viability-query.dto';
-import { SoilRiskProfile } from '../soil/interfaces/soil-risk-profile.interface';
+import { PoleViabilityScore } from '../scoring/interfaces/pole-viability-score.interface';
 
 /**
- * The public entry point for pole viability lookups. Currently just proxies
- * to `SoilService` and returns its raw soil risk profile — there's no
- * combined score yet. Once the climate service and scoring formula exist,
- * this is where they'll be combined; the soil-only response shape here will
- * very likely change when that happens, since it'll become one input to a
- * larger response rather than the whole thing.
+ * The public entry point for pole viability lookups — the one URL the
+ * outside world calls. Returns only the computed risk score
+ * (`dataAvailable`/`overallRisk`/`shortTermRisk`/`longTermRisk`) — the raw
+ * soil/climate/current-conditions inputs are logged, not returned (see
+ * `PoleViabilityService`).
  */
 @Controller('viability')
 export class ViabilityController {
-  constructor(private readonly soilService: SoilService) {}
+  constructor(private readonly poleViabilityService: PoleViabilityService) {}
 
   @Get()
-  getViability(@Query() query: GetViabilityQueryDto): Promise<SoilRiskProfile> {
-    return this.soilService.getSoilRiskProfile(query.lat, query.lng);
+  getViability(
+    @Query() query: GetViabilityQueryDto,
+  ): Promise<PoleViabilityScore> {
+    return this.poleViabilityService.getViabilityAssessment(
+      query.lat,
+      query.lng,
+    );
   }
 }

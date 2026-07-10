@@ -3,7 +3,45 @@ import { INestApplication, ValidationPipe } from '@nestjs/common';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
-import { SoilRiskProfile } from './../src/soil/interfaces/soil-risk-profile.interface';
+import { MscGeometClient } from './../src/climate/msc-geomet.client';
+import { PoleViabilityScore } from './../src/scoring/interfaces/pole-viability-score.interface';
+
+/**
+ * Mocks MscGeometClient rather than hitting the live MSC GeoMet API — same
+ * reasoning as the climate unit tests (see climate.service.spec.ts): slow,
+ * flaky, outside our control for CI. Soil still reads the real local
+ * landscape_data/ files, same as before — that's static data we control,
+ * not a live third-party dependency. This still exercises the real
+ * HTTP/validation/DI stack end-to-end, just without the live network call.
+ */
+const mockMscGeometClient = {
+  findNearestNormalsStation: jest.fn().mockResolvedValue({
+    climateIdentifier: '4016560',
+    name: "REGINA INT'L A",
+    distanceKm: 3.6,
+  }),
+  getAnnualNormals: jest.fn().mockResolvedValue({
+    valuesByNormalId: new Map<number, number>([
+      [90, 18.42],
+      [141, 29.48],
+      [56, 389.67],
+      [21, 115],
+      [28, 1573.16],
+    ]),
+    period: { begin: 1981, end: 2010 },
+  }),
+  findNearestCityConditions: jest.fn().mockResolvedValue({
+    identifier: 'sk-32',
+    name: 'Regina',
+    distanceKm: 0.54,
+    observedAt: '2026-07-10T16:00:00Z',
+    observationStationCode: 'yqr',
+    observationStationName: "Regina Int'l Airport",
+    windSpeedKmh: 15,
+    windGustKmh: 29,
+    temperatureCelsius: 23.9,
+  }),
+};
 
 describe('ViabilityController (e2e)', () => {
   let app: INestApplication<App>;
@@ -11,7 +49,10 @@ describe('ViabilityController (e2e)', () => {
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
-    }).compile();
+    })
+      .overrideProvider(MscGeometClient)
+      .useValue(mockMscGeometClient)
+      .compile();
 
     app = moduleFixture.createNestApplication();
     app.useGlobalPipes(
@@ -24,16 +65,30 @@ describe('ViabilityController (e2e)', () => {
     await app.close();
   });
 
-  it('returns the soil risk profile for a known Canadian location (Regina, SK)', async () => {
+  it('returns only the risk score for a known Canadian location (Regina, SK) — no raw soil/climate data', async () => {
     const response = await request(app.getHttpServer())
       .get('/viability')
       .query({ lat: 50.4452, lng: -104.6189 })
       .expect(200);
 
-    const profile = response.body as SoilRiskProfile;
-    expect(profile.dataAvailable).toBe(true);
-    expect(profile.polygonId).not.toBeNull();
-    expect(profile.component?.soilName).toBe('REGINA O.V');
+    const score = response.body as PoleViabilityScore;
+    expect(Object.keys(score).sort()).toEqual([
+      'dataAvailable',
+      'longTermRisk',
+      'overallRisk',
+      'shortTermRisk',
+    ]);
+    expect(score.dataAvailable).toBe(true);
+    for (const value of [
+      score.overallRisk,
+      score.shortTermRisk,
+      score.longTermRisk,
+    ]) {
+      expect(value).toBeGreaterThanOrEqual(0);
+      expect(value).toBeLessThanOrEqual(1);
+      // Rounded to 2 decimal places for display — the full-precision breakdown is logged, not returned.
+      expect(value).toBe(Math.round(value! * 100) / 100);
+    }
   });
 
   it('rejects a request missing lat/lng with 400', async () => {

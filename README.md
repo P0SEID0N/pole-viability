@@ -47,7 +47,6 @@ Early design phase — decisions below are being made and documented as the proj
   - `currentConditions` has no precipitation field at all (confirmed by sampling all ~844 cities) — it's an instantaneous station reading (temp/wind/pressure/humidity/dewpoint), not a rain gauge. Live precipitation would require `swob-realtime` instead (see above) — investigated, deferred as a separate task given its complexity.
   - Reads only `currentConditions` out of this collection's response. The full payload also contains a multi-day/hourly forecast tree (temperatures, wind, cloud/precip, UV, humidex, per 6-hour period) and the warnings array discussed above — both deliberately left unparsed.
   - Verified against real live data: Regina, SK returned 23.9°C, wind 15 km/h gusting to 29, from station "Regina Int'l Airport" (`yqr`) — matches what weather.gc.ca showed for Regina at the same time.
-  - Not yet wired into `GET /viability` or blended with the structural score — still an open design question how a live, time-varying signal should combine with (or sit alongside) the stable soil+normals-based rating.
 - **Soil data (SLC) — local shapefile set** lives in `landscape_data/` (SLC v3.2, 1:1,000,000 scale). Model reference: https://sis.agr.gc.ca/cansis/nsdb/slc/v3.2/model.html. It's a relational set of `.dbf` tables joined by key, not a single flat file:
 
   | File | Table | Join key(s) | Role |
@@ -89,11 +88,13 @@ Early design phase — decisions below are being made and documented as the proj
     - `SLT.ORGCARB` (organic carbon %) — redundant with `SNT.KIND` (mineral vs. organic) at the resolution the profile needs.
     - Kept from SLT: `BD` (bulk density — bearing-capacity proxy), texture % (sand/silt/clay — cohesion/frost/liquefaction behavior), `KSAT` (how long soil stays weak after rain, a natural join point with climate/precipitation data later). Chose to keep the full layer table over collapsing to `DRAINAGE` class alone because we have no real pole-failure data to calibrate against — continuous physical values are more defensible to derive formula weights from via published geotechnical bearing-capacity relationships than assigning arbitrary weights to someone else's categorical judgment calls.
 
-- **First API endpoint: `GET /viability?lat=<n>&lng=<n>`** (`src/viability/`) — the public entry point for pole viability lookups, and the one URL the outside world will call. For now it's a thin pass-through to `SoilService.getSoilRiskProfile` (no combined score yet — that comes once climate data and the scoring formula exist). The response shape here is expected to change once soil becomes one input among several rather than the whole response.
+- **API endpoint: `GET /viability?lat=<n>&lng=<n>`** (`src/viability/`) — the public entry point for pole viability lookups. Returns **only** `PoleViabilityScore` — `dataAvailable`, `overallRisk`, `shortTermRisk`, `longTermRisk` — not the raw soil/climate/current-conditions profiles or the contributing-factors breakdown that produced it. Those are logged instead (see "Scoring formula" > Logging below); the response is deliberately minimal display output, revised down from an earlier version that also echoed the raw profiles.
+  - `PoleViabilityService` (`src/viability/pole-viability.service.ts`) orchestrates the lookup: fetches soil + climate normals + current conditions in parallel (`Promise.all`), hands them to `RiskScoringService`, logs the three raw input profiles at full detail, and returns just the score. Kept separate from the controller so this orchestration is unit-testable without HTTP, and separate from `RiskScoringService` so the scoring math stays a pure function testable with fixed inputs.
   - Only `lat`/`lng` are accepted right now — city-name input needs geocoding, which isn't built (see open questions).
-  - Query params are validated with `class-validator`'s `@IsLatitude`/`@IsLongitude` (via a global `ValidationPipe` in `main.ts`, `transform: true` so query strings coerce to numbers first). Missing or out-of-range coordinates get a `400` with a clear message before ever reaching `SoilService` — no manual bounds-checking needed in the controller.
-  - A location outside SLC coverage (e.g. open ocean) is a normal `200` with `dataAvailable: false`, not an error — it's a valid answer ("no data here"), not a failure.
-  - Verified live: started the app and curled the endpoint directly (not just through tests) for the golden path (Regina, SK), missing params, an out-of-range latitude, and an ocean point — all behaved as above.
+  - Query params are validated with `class-validator`'s `@IsLatitude`/`@IsLongitude` (via a global `ValidationPipe` in `main.ts`, `transform: true` so query strings coerce to numbers first). Missing or out-of-range coordinates get a `400` with a clear message before ever reaching any service — no manual bounds-checking needed in the controller.
+  - A location with no soil/climate coverage (e.g. open ocean) is a normal `200` with `dataAvailable: false` and every risk field `null`, not an error — it's a valid answer ("no data here"), not a failure.
+  - **Testing**: the e2e test (`test/viability.e2e-spec.ts`) mocks `MscGeometClient` via NestJS's `overrideProvider` rather than hitting the live climate API — same reasoning as the climate unit tests, extended to e2e: still exercises the real HTTP/validation/DI stack end-to-end, just without a flaky live network dependency in CI. Soil still reads the real local `landscape_data/` files (static data we control, not a live dependency).
+  - Verified live: started the app and curled the endpoint directly (not just through tests) for the golden path (Regina, SK) and an ocean point (`dataAvailable: false`, every risk field `null`) — confirmed the response contains exactly the four score fields and nothing else, while the server log carries the full raw inputs and contributing-factors breakdown.
 
 ## Assumptions
 
@@ -104,18 +105,96 @@ Neither dataset alone tells us anything about pole failure — these are our own
 - **Wind loads the pole directly, independent of soil.** `climate.normals.meanWindSpeedKmh`/`highWindDaysPerYear` act on the pole's above-ground structure (lateral force against its height and any attached lines), not on the soil. This is the one factor pair that isn't soil-mediated — it should combine with the footing's resistance (`soil.depthToRestriction`, bearing capacity) rather than with soil-moisture factors.
 - **Slope compounds whatever the base soil/moisture risk already is, rather than being independent.** `soil.landform.slopePercent` on its own doesn't move a vertical pole, but on saturated or freeze-thaw-active soil it enables lateral creep/slide that flat ground wouldn't. Likely a multiplier on other factors rather than an additive term of its own.
 
+## Scoring formula
+
+`RiskScoringService` (`src/scoring/risk-scoring.service.ts`) turns the raw soil/climate/current-conditions profiles into `PoleViabilityScore`. Structure requested explicitly: compile soil data, combine with live weather for the location, produce a **long-term risk** (structural, from soil + 30-year climate normals) and a **short-term risk** (from live current conditions), then an **overall risk** clamped to `[0, 1]`. Every threshold below is a documented, researched guess — there's no pole-failure data to calibrate against (see Problem) — so treat this as a first defensible draft, not a validated model. Full reasoning lives in code comments next to each constant; this section is the map.
+
+**`dataAvailable`**: if soil, climate normals, or current conditions is itself unavailable for the location, every risk field is `null`, not a partial/best-effort number — a long-term score missing its climate half (or vice versa) isn't a lower-confidence version of the real answer, it's missing an input the formula depends on.
+
+### Soil code legends
+
+The formula needed the actual meaning of SLC's coded values, not just field names — pulled from AAFC's per-field legend pages (`sis.agr.gc.ca/cansis/nsdb/soil/v2/snt/*.html`, `.../slc/v3.2/crt/*.html`), closing an earlier open question:
+- **`DRAINAGE`** (best → worst): `VR` very rapid, `R` rapid, `W` well, `MW` moderately well, `I` imperfect, `P` poor, `VP` very poor.
+- **`WATERTBL`**: `NO` never present, `YU` present (unspecified period), `YN` non-growing season, `YG` growing season, `YB` always present.
+- **`KIND`**: `M` mineral, `O` organic, `N` true non-soil (airport/lake), `U` unclassified.
+- **`DEPTH`** class (root/footing depth before bedrock/hardpan/water table): `1` <25cm, `2` 25-49cm, `3` 50-74cm, `4` 75-99cm, `5` ≥100cm, `-`/missing non-applicable (e.g. rock at surface).
+
+### Long-term risk — structural baseline (soil + climate normals)
+
+A weighted combination of six sub-scores (each independently `[0, 1]`), directly implementing the four relationships in "Assumptions" above:
+
+| Sub-score | Weight | Inputs | What it captures |
+|---|---|---|---|
+| `footingDepthRisk` | 0.25 | average of `depthClassRisk` (`soil.depthToRestriction.depthClass`) and `bulkDensityRisk` (`soil.layers[0].bulkDensity`) | How deep a footing can go before hitting bedrock/hardpan/water table, **and** how much resistance the soil in that embedment zone actually provides. Depth class alone only answers the first question — see "Bulk density" below for why the second was added. |
+| `soilWetnessRisk` | 0.20 | `drainageClass` + `waterTableClass` (ordinal legends above), amplified by clay % and slope % | Static "how wet does this soil typically get" — the drainage/water-table classification, amplified because clay is strong dry but weak wet, and slope lets saturated/thawing soil creep. |
+| `saturationDurationRisk` | 0.15 | `climate.normals.totalPrecipitationMm` × `soil.layers[0].saturatedHydraulicConductivity` (`KSAT`) | Dynamic "how long does it stay wet after rain" — **multiplicative**, not additive: heavy rain on fast-draining soil isn't a saturation problem, slow drainage in a dry climate rarely gets saturated. Direct implementation of the rain/`KSAT` Assumption. |
+| `windRisk` | 0.20 | `climate.normals.meanWindSpeedKmh` + `highWindDaysPerYear`, amplified by `footingDepthRisk` | Wind loads the pole directly, independent of soil moisture (per Assumptions) — so it's amplified by footing depth (anchor resistance), not by wetness. |
+| `freezeThawRisk` | 0.20 | `climate.normals.frostFreePeriodDays` + `degreeDaysBelowZero`, amplified by `soilWetnessRisk` | Freeze-thaw cycle exposure from climate normals, amplified by soil wetness — dry soil freezing doesn't heave much. |
+| `organicSoilRisk` | additive bump, not part of the weighted split | `soil.drainage.kind` | Flat +0.3 for organic (`'O'`) soil (materially worse bearing capacity), +0.1 for unclassified/non-soil (genuinely unknown, not "safe by default"), 0 for ordinary mineral soil. |
+
+`longTermRisk = clamp01(weighted sum + organicSoilRisk)`.
+
+Every raw value is mapped to `[0, 1]` via `linearRisk(value, zeroRiskAt, oneRiskAt)` (`src/scoring/utils/risk-math.util.ts`) — linear interpolation between two reference points, clamped past either end; `zeroRiskAt > oneRiskAt` expresses an inverted relationship (e.g. a *shorter* frost-free period means *higher* risk). Reference points were chosen from the realistic Canadian range for each variable (e.g. 200mm-1200mm/yr precipitation spans dry Prairies to wet coastal BC; 10cm/hr-0.1cm/hr `KSAT` spans fast sandy to very slow heavy clay) — informed estimates, not measured thresholds.
+
+**Bulk density (2026-07-10 addition)**: an external environmental-scientist review (see "External review" below) flagged that `SLT.BD` was collected and documented as a "bearing-capacity proxy" but never actually read anywhere in the formula — a real gap between stated intent and implementation. `calculateBulkDensityRisk` now maps it via `linearRisk(bulkDensity, 1.6, 0.9)` (1.6 g/cm³ dense/compact → 0 risk, 0.9 g/cm³ loose/organic-influenced → max risk — the typical range for Canadian mineral soils), averaged with `depthClassRisk` into `footingDepthRisk`. Rationale per the review: real overturning resistance depends on soil strength within the embedment zone, not just whether a footing can physically reach a given depth before hitting rock/hardpan.
+
+### Short-term risk — live modifier (current conditions vs. normals/soil)
+
+Two sub-scores:
+- **`windAnomalyRisk`** — the larger of (a) current wind gust vs. this location's *normal* mean wind (anomaly), and (b) current gust against an absolute storm-force floor (40-100 km/h). Anomaly alone would under-react in a location whose "normal" is already windy; an absolute floor alone would miss a smaller-but-unusual local spike.
+- **`freezeThawTransitionRisk`** — peaks when current temperature is exactly 0°C (the active freeze-thaw boundary, where ice lens formation actually happens), tapering to 0 by ±5°C away, amplified by `soilWetnessRisk` (nothing to freeze in dry soil).
+
+`shortTermRisk = clamp01(windAnomalyRisk * 0.6 + freezeThawTransitionRisk * 0.4)`.
+
+**No live precipitation factor** — `citypageweather-realtime`'s `currentConditions` has no rain gauge field (see "Climate data" above); this is a known gap in the short-term side, not an oversight. `swob-realtime` would fill it but was deferred for complexity reasons.
+
+### Combining into `overallRisk`
+
+`overallRisk = clamp01(longTermRisk + shortTermRisk * 0.3)` — **additive**, not a blended average. A blended average (e.g. `0.7 * longTerm + 0.3 * shortTerm`) would let a calm moment artificially pull down an inherently risky location's score; additive means calm short-term conditions never discount the structural baseline, but genuinely elevated live conditions (high wind, active freeze-thaw) can meaningfully push the score up on top of it.
+
+### Worked example (verified against live data)
+
+Regina, SK (deep well-drained soil, BD 1.2 g/cm³, low slope, moderate wind/freeze-thaw normals, calm 23.9°C conditions with a 29 km/h gust): `longTermRisk ≈ 0.242`, `shortTermRisk ≈ 0.159`, `overallRisk ≈ 0.290` — a real but unremarkable risk level, which matches expectations for an ordinary prairie city block. (`longTermRisk` rose from an earlier ≈0.158 once bulk density was wired in — BD 1.2 g/cm³ isn't maximally dense, so it's no longer "free" the way depth class 5 alone implied.)
+
+### Logging
+
+`GET /viability` returns **only** `PoleViabilityScore`: `dataAvailable`, `overallRisk`, `shortTermRisk`, `longTermRisk` — each rounded to 2 decimal places (`roundTo2Decimals` in `risk-math.util.ts`). Everything else is logged, not returned, across two services:
+- `RiskScoringService` logs the full-precision `longTermRisk`/`shortTermRisk`/`overallRisk` plus the entire `contributingFactors` breakdown (`[RiskScoringService] Viability score for (lat, lng): {...}`) — the internal `ViabilityRiskBreakdown` type (`pole-viability-score.interface.ts`) is fully computed either way, just logged instead of returned.
+- `PoleViabilityService` logs the three raw input profiles it fetched — soil, climate normals, current conditions — in full (`[PoleViabilityService] Viability inputs for (lat, lng): soil=..., climate=..., currentConditions=...`).
+
+Rationale: the response is meant for minimal display/consumption; the raw inputs and granular breakdown are an operational/debugging concern that shouldn't bloat every request's payload, but shouldn't be lost either. Tests for the detailed sub-factor math (`risk-scoring.service.spec.ts`) capture the logged breakdown via a `Logger.prototype.log` spy rather than asserting on the response directly.
+
+### External review (2026-07-10)
+
+Had an environmental/geotechnical-science review done against real literature (utility pole-setting standards, soil physics, Canadian climatology) before trusting the formula further. Findings:
+- **Validated as well-anchored, not just plausible**: the wind reference points (10-30 km/h mean) track real EC normals closely (Regina/Lethbridge ~18.3-18.4 km/h; St. John's, Canada's windiest city, ~22-24 km/h); the `KSAT` range (10→0.1 cm/hr) matches published soil-physics values for sand vs. clay loam almost exactly; drainage-class-as-strength-proxy is consistent with published shear-strength-vs-saturation research (50-80% strength loss from optimum to saturated).
+- **Bulk density gap** — fixed, see above.
+- **Precipitation (200-1200mm) and degree-days-below-zero (200-3000)/frost-free-period (220-60 days) ranges saturate before the true extremes** of coastal BC (2000-3000mm/yr) and the far north are reached — acceptable as "risk saturates past a point," but it means the formula can't distinguish e.g. a cold Prairie city from an Arctic community. Not fixed; noted as a known limitation below.
+- **Soil wetness is currently counted in three places** (direct 20% weight, amplifies `freezeThawRisk`, amplifies `freezeThawTransitionRisk`) — may be intentional (wetness genuinely compounds with freezing physically) but wasn't a deliberate weighting decision. Open question below.
+
+### Known limitations
+
+Real, documented physical failure mechanisms this formula does not model at all — flagged by the external review, recorded here rather than silently absent. None of these are oversights so much as explicit scope calls given what data is actually available (see Problem: no per-pole data exists), but they should be visible, not implicit:
+
+- **Ice/freezing-rain load** — the single biggest scientific gap for a Canada-scoped tool. The January 1998 ice storm — Canada's most significant infrastructure-collapse event on record — felled roughly 30,000 utility poles; iced conductors present far more sail area, so ice load compounds multiplicatively with wind in real failure mechanics. Neither `windRisk` nor any other factor accounts for icing at all. Worth checking whether `climate-normals` has a freezing-rain/glaze element before building anything new.
+- **Guy-wire/anchoring** — real distribution poles, especially at corners/dead-ends, often get their primary overturning resistance from guying, not soil alone. This formula has no way to know whether a given pole is guyed, so it can only ever estimate *unguyed* site risk.
+- **Quick/sensitive (Leda) clay landslides** — a real, well-documented, Canada-specific hazard in the St. Lawrence/Ottawa Valley region (fatal historical events: Notre-Dame-de-la-Salette 1908, St-Jean-Vianney 1971, Lemieux 1993, St-Jude 2010). This is a distinct, sudden/catastrophic failure mode from the generic slope-creep model `slopeAmplifier` represents — can occur on very gentle slopes when the toe is eroded or the clay disturbed. SLC's taxonomic fields may or may not tag this cleanly; not currently checked for.
+- **Erosion/scour at the pole base** — proximity to a riverbank or drainage channel isn't captured by any SLC field currently used; undermining is a distinct failure mechanism from the saturation/bearing-capacity pathway already modeled.
+- **Permafrost engineering** — for northern locations where `degreeDaysBelowZero`/`frostFreePeriodDays` already clamp to max risk (see External review above), real infrastructure there typically uses entirely different foundation techniques (piles, thermosyphons) specifically because seasonal freeze-thaw modeling doesn't apply the same way in perennially frozen ground. "Max freeze-thaw risk" under this formula is a different physical regime in the true north than in, say, Winnipeg.
+- **Wood decay/rot** — worth stating plainly: published estimates attribute roughly 60-85% of *actual* real-world wood pole failures to fungal core rot, not any site/climate/soil mechanism at all. This is a genuine, deliberate scope boundary (no per-pole age/material/species/inspection data exists to model it against) rather than an oversight — this tool estimates *site* risk, not overall failure probability, and the single largest real-world cause of pole failure is structurally outside what it can ever answer.
+
 ## Open questions
 
-- Now that both `SoilService` and `ClimateService` exist as raw-factor lookups, how do the Assumptions above actually become formula weights/thresholds? This is the next real design step.
-- How should the live `getCurrentConditions` signal combine with the stable structural score — a temporary multiplier while wind/temp are extreme, a separate field in the response, something else? Also changes the caching story: the structural score is stable/cacheable, current conditions are not.
-- Is live precipitation (`swob-realtime`) worth the integration complexity, or is `climate-normals`' `totalPrecipitationMm` (long-term average) sufficient for the formula?
+- **The formula's weights/thresholds are an unvalidated first draft.** Every constant in `risk-scoring.service.ts` is a documented, researched guess (see "Scoring formula" above), not fitted to real outcomes — there's no pole-failure data to calibrate against. Revisit once there's any real signal (even informal — known problem poles, utility company incident data) to check the formula's outputs against.
+- Is `soilWetnessRisk` being counted three times (direct weight + amplifying `freezeThawRisk` + amplifying `freezeThawTransitionRisk`) a deliberate emphasis worth keeping, or accidental overweighting worth dialing back? Flagged by external review, not yet decided.
+- Should the ice/freezing-rain gap (see Known limitations) be addressed by checking `climate-normals` for a freezing-rain/glaze element, and if so, does it fold into `windRisk` (compounds with wind per real failure mechanics) or become its own factor?
+- `RESTR_TYPE`'s own code legend (`BN`/`SA`/`CT`/`LI`/etc. — see `soil_name_canada` restr_type.html) exists but isn't used in scoring yet; `footingDepthRisk` currently relies on `DEPTH` class + bulk density, which already captures "how deep, and how strong" without needing to weight the ~10 restriction-cause codes individually. Revisit if the formula ever needs to distinguish e.g. bedrock (immovable) from a softer restriction.
+- Is live precipitation (`swob-realtime`) worth the integration complexity, or is `climate-normals`' `totalPrecipitationMm` (long-term average) sufficient for the formula? Its absence is the biggest known gap on the short-term side.
 - Should `climate-daily`/`ltce-*` get pulled in later for more precise freeze-thaw-cycle counts and worst-case wind/precip events, or do the `climate-normals`-based proxies turn out to be good enough?
 - Should soil ingestion move to a real spatial database (e.g. PostGIS) once combined with climate data/if the dataset grows, or does in-memory-at-startup stay sufficient?
-- The per-table field codes (e.g. `DRAINAGE` class values, `RESTR_TYPE` codes) aren't in the top-level model doc — need to pull the legend from each table's own page (e.g. `slc/v3.2/crt/index.html`, `.../lst/index.html`) before the formula can interpret the coded values `SoilService` now returns.
 - Does "city name" input require geocoding to lat/long first (and via what service)?
-- Does the formula distinguish telephone poles vs. electrical poles (different material, height, load standards)?
-- What does the combined API response look like once soil + climate + a score are all present — a raw score, a risk category (low/medium/high), a probability, contributing factors breakdown? `GET /viability` currently returns only the soil profile; this will need to change.
-- Any persistence needed (caching climate lookups so we're not re-hitting MSC GeoMet on every request, storing formula versions/results), or is this fully stateless per-request?
+- Does the formula distinguish telephone poles vs. electrical poles (different material, height, load standards)? Currently one formula for any pole type.
+- Any persistence needed (caching climate lookups so we're not re-hitting MSC GeoMet on every request — every `GET /viability` call currently makes 2-4 live HTTP calls to MSC GeoMet, storing formula versions/results), or is this fully stateless per-request?
 
 ## Development
 
