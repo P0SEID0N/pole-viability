@@ -16,8 +16,9 @@ import { ScoreCacheRepository } from '../score-cache/score-cache.repository';
  *   data. The cache row's `shortTermRisk`/`overallRisk` are updated
  *   afterward either way.
  * - **Cache miss**: fetch all three inputs, compute the full score, and
- *   store it for next time (unless `dataAvailable` is false — nothing
- *   meaningful to cache for an out-of-coverage location).
+ *   store it for next time — as long as soil + climate normals resolved
+ *   (`cacheable` is non-null); a momentary current-conditions failure alone
+ *   doesn't block caching, since `longTermRisk` never depended on it.
  *
  * `GET /viability` returns only the score — the raw input profiles are
  * logged (here and in `RiskScoringService`), not returned. See README.md
@@ -72,11 +73,14 @@ export class PoleViabilityService {
       },
     );
 
-    if (score.dataAvailable) {
+    // score.dataAvailable is always true here (a cache hit means longTermRisk is
+    // already known), so check shortTermRisk itself to know whether this request
+    // actually got a fresh live reading worth persisting — not just "did it succeed."
+    if (score.shortTermRisk !== null) {
       this.scoreCacheRepository.updateShortTerm(
         lat,
         lng,
-        score.shortTermRisk!,
+        score.shortTermRisk,
         score.overallRisk!,
       );
     }
@@ -107,11 +111,17 @@ export class PoleViabilityService {
       );
 
     if (cacheable) {
+      // score.overallRisk is always non-null whenever cacheable is non-null (both
+      // require only soil+climate, see RiskScoringService.calculateViabilityScore).
+      // shortTermRisk can still be null here if current conditions failed on this
+      // particular request — 0 means "nothing to add on top of the structural
+      // baseline yet," and a future cache-hit request will refresh it once current
+      // conditions succeed.
       this.scoreCacheRepository.upsertFullScore({
         lat,
         lng,
         longTermRisk: cacheable.longTermRisk,
-        shortTermRisk: score.shortTermRisk!,
+        shortTermRisk: score.shortTermRisk ?? 0,
         overallRisk: score.overallRisk!,
         soilWetnessRisk: cacheable.soilWetnessRisk,
         meanWindSpeedKmh: cacheable.meanWindSpeedKmh,

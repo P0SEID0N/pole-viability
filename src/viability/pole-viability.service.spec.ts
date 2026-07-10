@@ -157,6 +157,37 @@ describe('PoleViabilityService', () => {
 
       expect(scoreCacheRepository.upsertFullScore).not.toHaveBeenCalled();
     });
+
+    it('still persists longTermRisk (with shortTermRisk defaulted to 0) when only current conditions failed', async () => {
+      // Matches what RiskScoringService.calculateViabilityScore actually returns
+      // when soil+climate succeed but current conditions don't: cacheable is
+      // still populated, score.shortTermRisk is null, overallRisk == longTermRisk.
+      riskScoringService.calculateViabilityScore.mockReturnValue({
+        score: {
+          dataAvailable: true,
+          overallRisk: 0.24,
+          shortTermRisk: null,
+          longTermRisk: 0.24,
+        },
+        cacheable: {
+          longTermRisk: 0.2421,
+          soilWetnessRisk: 0.11625,
+          meanWindSpeedKmh: 18.42,
+        },
+      });
+
+      await service.getViabilityAssessment(LAT, LNG);
+
+      expect(scoreCacheRepository.upsertFullScore).toHaveBeenCalledWith({
+        lat: LAT,
+        lng: LNG,
+        longTermRisk: 0.2421,
+        shortTermRisk: 0,
+        overallRisk: 0.24,
+        soilWetnessRisk: 0.11625,
+        meanWindSpeedKmh: 18.42,
+      });
+    });
   });
 
   describe('cache hit', () => {
@@ -233,17 +264,22 @@ describe('PoleViabilityService', () => {
       expect(scoreCacheRepository.upsertFullScore).not.toHaveBeenCalled();
     });
 
-    it('does not update the stored row when current conditions are unavailable', async () => {
+    it('does not update the stored row when current conditions are unavailable, but still returns the cached longTermRisk', async () => {
+      // Matches what RiskScoringService.calculateShortTermRiskOnly actually
+      // returns in this case: dataAvailable stays true (the cache hit already
+      // proved longTermRisk is valid), only shortTermRisk goes null.
       riskScoringService.calculateShortTermRiskOnly.mockReturnValue({
-        dataAvailable: false,
-        overallRisk: null,
+        dataAvailable: true,
+        overallRisk: 0.24,
         shortTermRisk: null,
-        longTermRisk: null,
+        longTermRisk: 0.24,
       });
 
-      await service.getViabilityAssessment(LAT, LNG);
+      const score = await service.getViabilityAssessment(LAT, LNG);
 
       expect(scoreCacheRepository.updateShortTerm).not.toHaveBeenCalled();
+      expect(score.longTermRisk).toBe(0.24);
+      expect(score.dataAvailable).toBe(true);
     });
   });
 });

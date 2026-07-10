@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { MscGeometClient } from './msc-geomet.client';
 import {
   CityPageCurrentConditionsProperties,
@@ -77,10 +78,19 @@ describe('MscGeometClient', () => {
   let client: MscGeometClient;
   let fetchMock: jest.Mock<Promise<Response>, [URL]>;
 
+  let warnSpy: jest.SpyInstance;
+
   beforeEach(() => {
     client = new MscGeometClient();
     fetchMock = jest.fn<Promise<Response>, [URL]>();
     global.fetch = fetchMock;
+    warnSpy = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
   });
 
   describe('findNearestNormalsStation', () => {
@@ -147,6 +157,33 @@ describe('MscGeometClient', () => {
         client.findNearestNormalsStation(50.4452, -104.6189),
       ).rejects.toThrow(/503/);
     });
+
+    it('skips a malformed station feature and still returns a valid nearby one, rather than failing the whole request', async () => {
+      const malformed = {
+        properties: { CLIMATE_IDENTIFIER: 'A' }, // STATION_NAME missing entirely
+        geometry: { type: 'Point', coordinates: [-104.5, 51.0] },
+      } as unknown as {
+        properties: ClimateStationProperties;
+        geometry: { type: 'Point'; coordinates: [number, number] };
+      };
+      const body: GeoJsonFeatureCollection<ClimateStationProperties> = {
+        features: [
+          malformed,
+          stationFeature('B', 'Near Station', -104.62, 50.45),
+        ],
+      };
+      fetchMock.mockResolvedValueOnce(mockJsonResponse(body));
+
+      const station = await client.findNearestNormalsStation(
+        50.4452,
+        -104.6189,
+      );
+
+      expect(station?.climateIdentifier).toBe('B');
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Skipping malformed climate-stations feature'),
+      );
+    });
   });
 
   describe('getAnnualNormals', () => {
@@ -201,6 +238,39 @@ describe('MscGeometClient', () => {
 
       expect(valuesByNormalId.size).toBe(0);
       expect(period).toBeNull();
+    });
+
+    it('skips a row with a missing VALUE and keeps the well-formed rows', async () => {
+      const malformedRow = {
+        properties: { NORMAL_ID: 90, PERIOD_BEGIN: 1981, PERIOD_END: 2010 }, // VALUE missing
+        geometry: { type: 'Point', coordinates: [-104.6, 50.4] },
+      } as unknown as {
+        properties: ClimateNormalProperties;
+        geometry: { type: 'Point'; coordinates: [number, number] };
+      };
+      const body: GeoJsonFeatureCollection<ClimateNormalProperties> = {
+        features: [
+          malformedRow,
+          {
+            properties: {
+              NORMAL_ID: 56,
+              VALUE: 389.67,
+              PERIOD_BEGIN: 1981,
+              PERIOD_END: 2010,
+            },
+            geometry: { type: 'Point', coordinates: [-104.6, 50.4] },
+          },
+        ],
+      };
+      fetchMock.mockResolvedValueOnce(mockJsonResponse(body));
+
+      const { valuesByNormalId } = await client.getAnnualNormals('4016560');
+
+      expect(valuesByNormalId.get(90)).toBeUndefined();
+      expect(valuesByNormalId.get(56)).toBe(389.67);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Skipping malformed climate-normals feature'),
+      );
     });
   });
 
@@ -258,6 +328,57 @@ describe('MscGeometClient', () => {
 
       expect(city).toBeNull();
       expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
+    it('skips a city feature with a malformed currentConditions block and still returns a valid nearby one', async () => {
+      // Simulates a real-world station outage / EC schema drift: `wind` present but gutted.
+      const malformed = {
+        properties: {
+          identifier: 'sk-1',
+          name: { en: 'Far City' },
+          currentConditions: { wind: {} },
+        },
+        geometry: { type: 'Point', coordinates: [-104.5, 51.0] },
+      } as unknown as {
+        properties: CityPageProperties;
+        geometry: { type: 'Point'; coordinates: [number, number] };
+      };
+      const body: GeoJsonFeatureCollection<CityPageProperties> = {
+        features: [malformed, cityFeature('sk-32', 'Regina', -104.62, 50.45)],
+      };
+      fetchMock.mockResolvedValueOnce(mockJsonResponse(body));
+
+      const city = await client.findNearestCityConditions(50.4452, -104.6189);
+
+      expect(city?.identifier).toBe('sk-32');
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'Skipping malformed citypageweather-realtime feature',
+        ),
+      );
+    });
+
+    it('does not throw, and returns null, when every candidate in the widest search box is malformed', async () => {
+      const malformed = {
+        properties: {
+          identifier: 'sk-1',
+          name: { en: 'Only City' },
+          currentConditions: { wind: {} },
+        },
+        geometry: { type: 'Point', coordinates: [-40, 45] },
+      } as unknown as {
+        properties: CityPageProperties;
+        geometry: { type: 'Point'; coordinates: [number, number] };
+      };
+      fetchMock.mockResolvedValue(
+        mockJsonResponse<GeoJsonFeatureCollection<CityPageProperties>>({
+          features: [malformed],
+        }),
+      );
+
+      const city = await client.findNearestCityConditions(45, -40);
+
+      expect(city).toBeNull();
     });
   });
 });

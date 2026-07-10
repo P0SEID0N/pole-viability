@@ -87,34 +87,41 @@ export class RiskScoringService {
    * This is the full/cache-miss path; see `calculateShortTermRiskOnly` for
    * the cache-hit path that skips re-deriving `longTermRisk`.
    *
+   * `longTermRisk` depends only on soil + climate normals, not current
+   * conditions — so it's computed (and `cacheable` populated) whenever soil
+   * and climate are both available, **independent of whether current
+   * conditions succeeded**. Gating `cacheable` on all three used to mean a
+   * location with perfectly good soil/climate data could never be cached
+   * just because `citypageweather-realtime` had no nearby city point for it
+   * on that one request — that's an availability problem with the live
+   * signal, not a reason to also throw away the stable one.
+   *
    * The full-precision breakdown (`contributingFactors`, plus unrounded
    * copies of the three risk numbers) is logged rather than returned — see
    * README.md "Scoring formula" > Logging. The public `score` carries only
    * `overallRisk`/`shortTermRisk`/`longTermRisk`, each rounded to 2 decimal
    * places for display.
    *
-   * @returns `score` with `dataAvailable: false` and every risk field
-   *   `null`, and `cacheable: null`, if any of the three inputs are
-   *   themselves unavailable for this location — a long-term score without
-   *   climate data (or vice versa) would be missing half its inputs, not
-   *   just a lower-confidence version of the real answer. Otherwise
-   *   `cacheable` carries the unrounded state `ScoreCacheRepository` needs
-   *   to persist for a future cache hit.
+   * @returns `score` with `dataAvailable: false`, every risk field `null`,
+   *   and `cacheable: null` if soil or climate is unavailable — a
+   *   long-term score without either of those would be missing half its
+   *   inputs, not just a lower-confidence version of the real answer. If
+   *   soil and climate are available but current conditions are not,
+   *   `score.dataAvailable` is `true` with `longTermRisk`/`overallRisk`
+   *   populated (`overallRisk` equals `longTermRisk` — nothing to add on
+   *   top without a live reading) and `shortTermRisk: null`; `cacheable`
+   *   is still populated. Otherwise all three risk fields are populated
+   *   normally.
    */
   calculateViabilityScore(
     soil: SoilRiskProfile,
     climate: ClimateRiskProfile,
     current: CurrentConditionsProfile,
   ): { score: PoleViabilityScore; cacheable: CacheableLongTermRisk | null } {
-    if (
-      !soil.dataAvailable ||
-      !climate.dataAvailable ||
-      !current.dataAvailable
-    ) {
+    if (!soil.dataAvailable || !climate.dataAvailable) {
       this.logger.log(
         `Viability score unavailable for (${soil.location.lat}, ${soil.location.lng}): ` +
-          `soil.dataAvailable=${soil.dataAvailable}, climate.dataAvailable=${climate.dataAvailable}, ` +
-          `current.dataAvailable=${current.dataAvailable}`,
+          `soil.dataAvailable=${soil.dataAvailable}, climate.dataAvailable=${climate.dataAvailable}`,
       );
       return {
         score: {
@@ -128,7 +135,6 @@ export class RiskScoringService {
     }
 
     const normals = climate.normals!;
-    const conditions = current.conditions!;
     const layer = soil.layers[0];
 
     const depthClassRisk =
@@ -170,6 +176,33 @@ export class RiskScoringService {
         organicSoilRisk,
     );
 
+    // longTermRisk (and everything it needs) is fully resolved at this point,
+    // regardless of whether current conditions succeeded below — cacheable
+    // reflects that, so a location never loses caching just because the live
+    // signal happened to be unavailable on this particular request.
+    const cacheable: CacheableLongTermRisk = {
+      longTermRisk,
+      soilWetnessRisk,
+      meanWindSpeedKmh: normals.meanWindSpeedKmh,
+    };
+
+    if (!current.dataAvailable) {
+      this.logger.log(
+        `Long-term risk computed for (${soil.location.lat}, ${soil.location.lng}) but current conditions ` +
+          `unavailable — shortTermRisk not computed. longTermRisk=${longTermRisk}`,
+      );
+      return {
+        score: {
+          dataAvailable: true,
+          overallRisk: roundTo2Decimals(longTermRisk),
+          shortTermRisk: null,
+          longTermRisk: roundTo2Decimals(longTermRisk),
+        },
+        cacheable,
+      };
+    }
+
+    const conditions = current.conditions!;
     const windAnomalyRisk = this.calculateWindAnomalyRisk(
       conditions.windGustKmh ?? conditions.windSpeedKmh,
       normals.meanWindSpeedKmh,
@@ -218,11 +251,7 @@ export class RiskScoringService {
         shortTermRisk: roundTo2Decimals(shortTermRisk),
         longTermRisk: roundTo2Decimals(longTermRisk),
       },
-      cacheable: {
-        longTermRisk,
-        soilWetnessRisk,
-        meanWindSpeedKmh: normals.meanWindSpeedKmh,
-      },
+      cacheable,
     };
   }
 
@@ -233,11 +262,14 @@ export class RiskScoringService {
    * soil or climate normals. This is the cache-hit path — see
    * `calculateViabilityScore` for the full computation.
    *
-   * @returns `dataAvailable: false` with every risk field `null` if current
-   *   conditions are themselves unavailable — same "missing an input, not
-   *   just lower-confidence" reasoning as the full path. Otherwise
-   *   `shortTermRisk` is freshly computed and `overallRisk` is derived from
-   *   the fresh short-term risk plus the cached long-term risk.
+   * @returns `dataAvailable: true` with `longTermRisk`/`overallRisk` taken
+   *   straight from `cached` and `shortTermRisk: null` if current
+   *   conditions are themselves unavailable — the caller already has a
+   *   valid cached long-term score (that's what made this a cache hit), so
+   *   a momentary live-conditions failure shouldn't throw that away, same
+   *   reasoning as the equivalent branch in `calculateViabilityScore`.
+   *   Otherwise `shortTermRisk` is freshly computed and `overallRisk` is
+   *   derived from the fresh short-term risk plus the cached long-term risk.
    */
   calculateShortTermRiskOnly(
     current: CurrentConditionsProfile,
@@ -245,13 +277,14 @@ export class RiskScoringService {
   ): PoleViabilityScore {
     if (!current.dataAvailable) {
       this.logger.log(
-        `Short-term risk recompute unavailable for (${current.location.lat}, ${current.location.lng}): current.dataAvailable=false`,
+        `Short-term risk recompute skipped for (${current.location.lat}, ${current.location.lng}): current.dataAvailable=false. ` +
+          `Falling back to cached longTermRisk=${cached.longTermRisk}`,
       );
       return {
-        dataAvailable: false,
-        overallRisk: null,
+        dataAvailable: true,
+        overallRisk: roundTo2Decimals(cached.longTermRisk),
         shortTermRisk: null,
-        longTermRisk: null,
+        longTermRisk: roundTo2Decimals(cached.longTermRisk),
       };
     }
 

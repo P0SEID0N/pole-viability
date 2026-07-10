@@ -143,8 +143,8 @@ describe('RiskScoringService', () => {
       expect(score.dataAvailable).toBe(false);
     });
 
-    it('returns dataAvailable=false when current conditions are unavailable', () => {
-      const { score } = service.calculateViabilityScore(
+    it('falls back to longTermRisk alone, but still populates cacheable, when only current conditions are unavailable', () => {
+      const { score, cacheable } = service.calculateViabilityScore(
         reginaSoil(),
         reginaClimate(),
         {
@@ -154,7 +154,16 @@ describe('RiskScoringService', () => {
         },
       );
 
-      expect(score.dataAvailable).toBe(false);
+      // Soil + climate are what longTermRisk needs — current conditions failing
+      // alone shouldn't discard a perfectly good structural score, and shouldn't
+      // block caching it either (this is the fix for the "a location can never be
+      // cached just because citypageweather has no nearby city point" gap).
+      expect(score.dataAvailable).toBe(true);
+      expect(score.shortTermRisk).toBeNull();
+      expect(score.longTermRisk).not.toBeNull();
+      expect(score.overallRisk).toBe(score.longTermRisk);
+      expect(cacheable).not.toBeNull();
+      expect(cacheable?.longTermRisk).toBeCloseTo(score.longTermRisk!, 2);
     });
 
     it('returns dataAvailable/overallRisk/shortTermRisk/longTermRisk in the score, not contributingFactors', () => {
@@ -529,7 +538,7 @@ describe('RiskScoringService', () => {
       expect(gusty.longTermRisk).toBe(calm.longTermRisk);
     });
 
-    it('returns dataAvailable=false with every field null when current conditions are unavailable', () => {
+    it('falls back to the cached longTermRisk alone when current conditions are unavailable, rather than nulling everything out', () => {
       const score = service.calculateShortTermRiskOnly(
         {
           ...reginaCurrentConditions(),
@@ -539,11 +548,14 @@ describe('RiskScoringService', () => {
         cached,
       );
 
+      // The cache hit already proved longTermRisk is valid — a momentary live
+      // conditions failure shouldn't throw that away (mirrors the equivalent
+      // branch in calculateViabilityScore).
       expect(score).toEqual({
-        dataAvailable: false,
-        overallRisk: null,
+        dataAvailable: true,
+        overallRisk: Math.round(cached.longTermRisk * 100) / 100,
         shortTermRisk: null,
-        longTermRisk: null,
+        longTermRisk: Math.round(cached.longTermRisk * 100) / 100,
       });
     });
   });

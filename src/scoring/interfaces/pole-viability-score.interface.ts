@@ -14,11 +14,18 @@
  * for display, while the logged values retain full precision.
  */
 export interface PoleViabilityScore {
-  /** false when soil, climate normals, or current conditions data is unavailable for this location — null rather than a guessed risk. */
+  /**
+   * false only when soil or climate-normals data is unavailable for this
+   * location — those are the two inputs `longTermRisk` needs, and without
+   * either there's no meaningful score at all. If soil/climate succeed but
+   * current conditions don't, `dataAvailable` is still `true`: `longTermRisk`
+   * is real, `overallRisk` falls back to it alone, and only `shortTermRisk`
+   * goes `null` (see that field's own doc).
+   */
   dataAvailable: boolean;
-  /** [0, 1], rounded to 2 decimal places. Full-precision value is logged, not returned. */
+  /** [0, 1], rounded to 2 decimal places. Full-precision value is logged, not returned. Equals `longTermRisk` when `shortTermRisk` is `null`. */
   overallRisk: number | null;
-  /** [0, 1], rounded to 2 decimal places — risk from live conditions (wind anomaly, freeze-thaw transition) on top of the structural baseline. */
+  /** [0, 1], rounded to 2 decimal places — risk from live conditions (wind anomaly, freeze-thaw transition) on top of the structural baseline. `null` when current conditions couldn't be fetched, even if `dataAvailable` is `true`. */
   shortTermRisk: number | null;
   /** [0, 1], rounded to 2 decimal places — risk from structural soil/30-year-climate-normal factors. */
   longTermRisk: number | null;

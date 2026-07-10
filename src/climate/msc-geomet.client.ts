@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import {
   CityPageProperties,
   ClimateNormalProperties,
@@ -55,6 +55,8 @@ interface WithDistance {
  */
 @Injectable()
 export class MscGeometClient {
+  private readonly logger = new Logger(MscGeometClient.name);
+
   /**
    * Finds the nearest station that reports 30-year climate normals. Returns
    * `null` rather than throwing if none is found even at the widest search
@@ -120,15 +122,32 @@ export class MscGeometClient {
 
     const valuesByNormalId = new Map<number, number>();
     let period: { begin: number; end: number } | null = null;
-    for (const feature of data.features) {
-      valuesByNormalId.set(
-        feature.properties.NORMAL_ID,
-        feature.properties.VALUE,
-      );
-      period ??= {
-        begin: feature.properties.PERIOD_BEGIN,
-        end: feature.properties.PERIOD_END,
-      };
+    for (const row of this.parseFeatures(
+      data.features,
+      'climate-normals',
+      (feature) => {
+        const { NORMAL_ID, VALUE, PERIOD_BEGIN, PERIOD_END } =
+          feature.properties;
+        if (
+          typeof NORMAL_ID !== 'number' ||
+          typeof VALUE !== 'number' ||
+          typeof PERIOD_BEGIN !== 'number' ||
+          typeof PERIOD_END !== 'number'
+        ) {
+          throw new Error(
+            'missing/invalid NORMAL_ID, VALUE, PERIOD_BEGIN, or PERIOD_END',
+          );
+        }
+        return {
+          normalId: NORMAL_ID,
+          value: VALUE,
+          begin: PERIOD_BEGIN,
+          end: PERIOD_END,
+        };
+      },
+    )) {
+      valuesByNormalId.set(row.normalId, row.value);
+      period ??= { begin: row.begin, end: row.end };
     }
     return { valuesByNormalId, period };
   }
@@ -178,16 +197,25 @@ export class MscGeometClient {
         url,
       );
 
-    return data.features.map((feature) => ({
-      climateIdentifier: feature.properties.CLIMATE_IDENTIFIER,
-      name: feature.properties.STATION_NAME,
-      distanceKm: haversineDistanceKm(
-        lat,
-        lng,
-        feature.geometry.coordinates[1],
-        feature.geometry.coordinates[0],
-      ),
-    }));
+    return this.parseFeatures(data.features, 'climate-stations', (feature) => {
+      const { CLIMATE_IDENTIFIER, STATION_NAME } = feature.properties;
+      if (
+        typeof CLIMATE_IDENTIFIER !== 'string' ||
+        typeof STATION_NAME !== 'string'
+      ) {
+        throw new Error('missing/invalid CLIMATE_IDENTIFIER or STATION_NAME');
+      }
+      return {
+        climateIdentifier: CLIMATE_IDENTIFIER,
+        name: STATION_NAME,
+        distanceKm: haversineDistanceKm(
+          lat,
+          lng,
+          feature.geometry.coordinates[1],
+          feature.geometry.coordinates[0],
+        ),
+      };
+    });
   }
 
   private async fetchCityConditionsInBbox(
@@ -205,25 +233,87 @@ export class MscGeometClient {
     const data =
       await this.fetchJson<GeoJsonFeatureCollection<CityPageProperties>>(url);
 
-    return data.features.map((feature) => {
-      const conditions = feature.properties.currentConditions;
-      return {
-        identifier: feature.properties.identifier,
-        name: feature.properties.name.en,
-        distanceKm: haversineDistanceKm(
-          lat,
-          lng,
-          feature.geometry.coordinates[1],
-          feature.geometry.coordinates[0],
-        ),
-        observedAt: conditions.timestamp.en,
-        observationStationCode: conditions.station.code.en,
-        observationStationName: conditions.station.value.en,
-        windSpeedKmh: conditions.wind.speed.value.en,
-        windGustKmh: conditions.wind.gust?.value.en ?? null,
-        temperatureCelsius: conditions.temperature.value.en,
-      };
-    });
+    return this.parseFeatures(
+      data.features,
+      'citypageweather-realtime',
+      (feature) => {
+        const {
+          identifier,
+          name,
+          currentConditions: conditions,
+        } = feature.properties;
+        if (typeof identifier !== 'string' || typeof name?.en !== 'string') {
+          throw new Error('missing/invalid identifier or name');
+        }
+        const windSpeedKmh = conditions?.wind?.speed?.value?.en;
+        const temperatureCelsius = conditions?.temperature?.value?.en;
+        const observationStationCode = conditions?.station?.code?.en;
+        const observationStationName = conditions?.station?.value?.en;
+        const observedAt = conditions?.timestamp?.en;
+        if (
+          typeof windSpeedKmh !== 'number' ||
+          typeof temperatureCelsius !== 'number' ||
+          typeof observationStationCode !== 'string' ||
+          typeof observationStationName !== 'string' ||
+          typeof observedAt !== 'string'
+        ) {
+          throw new Error(
+            'missing/invalid currentConditions (wind, temperature, station, or timestamp)',
+          );
+        }
+        return {
+          identifier,
+          name: name.en,
+          distanceKm: haversineDistanceKm(
+            lat,
+            lng,
+            feature.geometry.coordinates[1],
+            feature.geometry.coordinates[0],
+          ),
+          observedAt,
+          observationStationCode,
+          observationStationName,
+          windSpeedKmh,
+          windGustKmh: conditions?.wind?.gust?.value?.en ?? null,
+          temperatureCelsius,
+        };
+      },
+    );
+  }
+
+  /**
+   * Parses every feature in a collection response, skipping (and warning on)
+   * any single feature that fails `parse` rather than letting one malformed
+   * record — a station outage, a maintenance gap, any drift in a live
+   * third-party API's response shape — fail every candidate in the bbox and
+   * take down an otherwise-valid request. The GeoJSON envelope itself
+   * (`data.features` existing as an array) is trusted; only the
+   * per-feature content is treated as untrusted.
+   */
+  private parseFeatures<TProperties, TResult>(
+    features: {
+      properties: TProperties;
+      geometry: { type: 'Point'; coordinates: [number, number] };
+    }[],
+    collectionName: string,
+    parse: (feature: {
+      properties: TProperties;
+      geometry: { type: 'Point'; coordinates: [number, number] };
+    }) => TResult,
+  ): TResult[] {
+    const results: TResult[] = [];
+    for (const feature of features) {
+      try {
+        results.push(parse(feature));
+      } catch (error) {
+        this.logger.warn(
+          `Skipping malformed ${collectionName} feature: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+    return results;
   }
 
   private async fetchJson<T>(url: URL): Promise<T> {
