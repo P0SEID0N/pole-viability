@@ -60,6 +60,14 @@ Early design phase — decisions below are being made and documented as the proj
   - Data directory defaults to `landscape_data/` at the repo root, overridable via `SLC_DATA_DIR` env var.
   - Verified against real data: `SoilService.getSoilRiskProfile(50.4452, -104.6189)` (Regina, SK) correctly resolves to soil series "REGINA O.V." with clay % (62-69%) consistent with the real-world Regina clay soil series. A point in the open ocean correctly returns `dataAvailable: false`.
   - `landscape_data/` is gitignored (62MB of binary GIS data) — not committed to the repo; anyone working on this needs to download it separately from AAFC (see the SLC link above) and place it at the repo root.
+  - **Startup verification**: since the data isn't in git, `SlcDataRepository` checks that every required SLC file is present and readable *before* attempting to parse any of them. If the dataset (or `SLC_DATA_DIR`) is missing or incomplete, app startup fails immediately with one clear error naming exactly which files are missing and where to get them — instead of a cryptic `ENOENT` from inside the `shapefile` library.
+  - **Field trim (2026-07-10 review)**: went through every parsed field and cut ones with no clear structural-stability argument for pole fall risk, to keep the profile focused on things a formula can actually justify a weight for:
+    - `CRT.AWHC` (available water holding capacity) — an agronomic irrigation metric, not a structural one.
+    - `CRT.CFRAG1`/`CFRAG2` (coarse fragment class) — no clear directional relationship to fall risk either way.
+    - `SNT.ROOTRESTRI` (root restriction) — redundant with `CRT.DEPTH`/`RESTR_TYPE`, which already describe the same restrictive layer in more detail.
+    - `CMP.SLOPE` (component-level coded slope class) — redundant with the landform table's numeric `LFS_SLOPE`, which is more precise and already reported via `getDominantLandform`.
+    - `SLT.ORGCARB` (organic carbon %) — redundant with `SNT.KIND` (mineral vs. organic) at the resolution the profile needs.
+    - Kept from SLT: `BD` (bulk density — bearing-capacity proxy), texture % (sand/silt/clay — cohesion/frost/liquefaction behavior), `KSAT` (how long soil stays weak after rain, a natural join point with climate/precipitation data later). Chose to keep the full layer table over collapsing to `DRAINAGE` class alone because we have no real pole-failure data to calibrate against — continuous physical values are more defensible to derive formula weights from via published geotechnical bearing-capacity relationships than assigning arbitrary weights to someone else's categorical judgment calls.
 
 ## Open questions
 

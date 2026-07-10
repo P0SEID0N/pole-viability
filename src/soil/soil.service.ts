@@ -8,7 +8,23 @@ export class SoilService {
 
   /**
    * Looks up the raw soil risk factors for a location from the SLC dataset.
-   * This returns joined data, not a computed score — scoring is a separate step.
+   *
+   * Resolves the lat/lng to its containing SLC polygon, then joins across
+   * the component (CMP), rating (CRT), soil name (SNT), soil layer (SLT),
+   * and landscape segmentation (LST/LDT) tables — see README.md "Soil data
+   * (SLC)" for what each table contributes and why. When a polygon has
+   * multiple soil components or landscape segments, only the dominant one
+   * (highest `PERCENT`) is used; see `SlcDataRepository.getDominantComponent`
+   * and `getDominantLandform`.
+   *
+   * This returns joined, normalized data, not a computed risk score —
+   * scoring is a separate, later step that consumes this profile.
+   *
+   * @param lat - Latitude in decimal degrees.
+   * @param lng - Longitude in decimal degrees.
+   * @returns The joined soil profile for the location. If the point falls
+   *   outside SLC coverage (e.g. open ocean, outside Canada), `dataAvailable`
+   *   is `false` and all factor fields are `null`/empty.
    */
   async getSoilRiskProfile(lat: number, lng: number): Promise<SoilRiskProfile> {
     await this.slcData.whenReady();
@@ -42,7 +58,6 @@ export class SoilService {
       component: component
         ? {
             percentOfPolygon: component.percent,
-            slopeClass: component.slopeClass,
             stoninessClass: component.stoninessClass,
             soilId: component.soilId,
             soilName: soilName?.soilName ?? null,
@@ -52,9 +67,6 @@ export class SoilService {
         ? {
             depthClass: rating.depthClass,
             restrictionType: rating.restrictionType,
-            availableWaterHoldingCapacityClass:
-              rating.availableWaterHoldingCapacityClass,
-            coarseFragmentClasses: rating.coarseFragmentClasses,
           }
         : null,
       drainage: soilName
@@ -62,7 +74,6 @@ export class SoilService {
             kind: soilName.kind,
             drainageClass: soilName.drainageClass,
             waterTableClass: soilName.waterTableClass,
-            rootRestriction: soilName.rootRestriction,
           }
         : null,
       layers: layers.map((layer) => ({
@@ -73,7 +84,6 @@ export class SoilService {
         sandPercent: layer.sandPercent,
         siltPercent: layer.siltPercent,
         clayPercent: layer.clayPercent,
-        organicCarbonPercent: layer.organicCarbonPercent,
         saturatedHydraulicConductivity: layer.saturatedHydraulicConductivity,
       })),
       landform: dominantLandform

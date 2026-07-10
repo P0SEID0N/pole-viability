@@ -10,7 +10,6 @@ export interface SoilRiskProfile {
   component: {
     /** Share of the polygon this soil component covers, 0-100. */
     percentOfPolygon: number;
-    slopeClass: string | null;
     stoninessClass: string | null;
     soilId: string;
     soilName: string | null;
@@ -19,15 +18,12 @@ export interface SoilRiskProfile {
     depthClass: string | null;
     /** e.g. bedrock, hardpan, water table — what limits footing depth. */
     restrictionType: string | null;
-    availableWaterHoldingCapacityClass: string | null;
-    coarseFragmentClasses: (string | null)[];
   } | null;
   drainage: {
     /** Mineral vs. organic soil. */
     kind: string | null;
     drainageClass: string | null;
     waterTableClass: string | null;
-    rootRestriction: string | null;
   } | null;
   layers: {
     layerNo: number;
@@ -37,7 +33,6 @@ export interface SoilRiskProfile {
     sandPercent: number | null;
     siltPercent: number | null;
     clayPercent: number | null;
-    organicCarbonPercent: number | null;
     saturatedHydraulicConductivity: number | null;
   }[];
   landform: {

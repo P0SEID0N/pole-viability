@@ -7,7 +7,6 @@ export interface CmpRecord {
   polyId: number;
   cmpId: number;
   percent: number;
-  slopeClass: string | null;
   stoninessClass: string | null;
   soilId: string;
 }
@@ -16,8 +15,6 @@ export interface CrtRecord {
   cmpId: number;
   depthClass: string | null;
   restrictionType: string | null;
-  availableWaterHoldingCapacityClass: string | null;
-  coarseFragmentClasses: (string | null)[];
 }
 
 export interface SntRecord {
@@ -26,7 +23,6 @@ export interface SntRecord {
   kind: string | null;
   drainageClass: string | null;
   waterTableClass: string | null;
-  rootRestriction: string | null;
 }
 
 export interface SltRecord {
@@ -38,7 +34,6 @@ export interface SltRecord {
   sandPercent: number | null;
   siltPercent: number | null;
   clayPercent: number | null;
-  organicCarbonPercent: number | null;
   saturatedHydraulicConductivity: number | null;
 }
 
