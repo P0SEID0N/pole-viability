@@ -3,6 +3,7 @@ import { SoilRiskProfile } from '../soil/interfaces/soil-risk-profile.interface'
 import { ClimateRiskProfile } from '../climate/interfaces/climate-risk-profile.interface';
 import { CurrentConditionsProfile } from '../climate/interfaces/current-conditions-profile.interface';
 import {
+  CacheableLongTermRisk,
   PoleViabilityScore,
   ViabilityRiskBreakdown,
 } from './interfaces/pole-viability-score.interface';
@@ -83,24 +84,28 @@ export class RiskScoringService {
    * fetched soil, climate-normals, and current-conditions profiles. A pure
    * function aside from logging: no I/O here, just the formula — fetching
    * the three input profiles is the caller's job (see `PoleViabilityService`).
+   * This is the full/cache-miss path; see `calculateShortTermRiskOnly` for
+   * the cache-hit path that skips re-deriving `longTermRisk`.
    *
    * The full-precision breakdown (`contributingFactors`, plus unrounded
    * copies of the three risk numbers) is logged rather than returned — see
-   * README.md "Scoring formula" > Logging. The public result carries only
+   * README.md "Scoring formula" > Logging. The public `score` carries only
    * `overallRisk`/`shortTermRisk`/`longTermRisk`, each rounded to 2 decimal
    * places for display.
    *
-   * @returns `dataAvailable: false` with every risk field `null` if any of
-   *   the three inputs are themselves unavailable for this location — a
-   *   long-term score without climate data (or vice versa) would be
-   *   missing half its inputs, not just a lower-confidence version of the
-   *   real answer.
+   * @returns `score` with `dataAvailable: false` and every risk field
+   *   `null`, and `cacheable: null`, if any of the three inputs are
+   *   themselves unavailable for this location — a long-term score without
+   *   climate data (or vice versa) would be missing half its inputs, not
+   *   just a lower-confidence version of the real answer. Otherwise
+   *   `cacheable` carries the unrounded state `ScoreCacheRepository` needs
+   *   to persist for a future cache hit.
    */
   calculateViabilityScore(
     soil: SoilRiskProfile,
     climate: ClimateRiskProfile,
     current: CurrentConditionsProfile,
-  ): PoleViabilityScore {
+  ): { score: PoleViabilityScore; cacheable: CacheableLongTermRisk | null } {
     if (
       !soil.dataAvailable ||
       !climate.dataAvailable ||
@@ -112,10 +117,13 @@ export class RiskScoringService {
           `current.dataAvailable=${current.dataAvailable}`,
       );
       return {
-        dataAvailable: false,
-        overallRisk: null,
-        shortTermRisk: null,
-        longTermRisk: null,
+        score: {
+          dataAvailable: false,
+          overallRisk: null,
+          shortTermRisk: null,
+          longTermRisk: null,
+        },
+        cacheable: null,
       };
     }
 
@@ -204,10 +212,75 @@ export class RiskScoringService {
     );
 
     return {
+      score: {
+        dataAvailable: true,
+        overallRisk: roundTo2Decimals(overallRisk),
+        shortTermRisk: roundTo2Decimals(shortTermRisk),
+        longTermRisk: roundTo2Decimals(longTermRisk),
+      },
+      cacheable: {
+        longTermRisk,
+        soilWetnessRisk,
+        meanWindSpeedKmh: normals.meanWindSpeedKmh,
+      },
+    };
+  }
+
+  /**
+   * Recomputes just `shortTermRisk` from live current conditions, reusing a
+   * previously-cached `longTermRisk` (and the `soilWetnessRisk`/
+   * `meanWindSpeedKmh` its sub-calculations need) instead of re-fetching
+   * soil or climate normals. This is the cache-hit path — see
+   * `calculateViabilityScore` for the full computation.
+   *
+   * @returns `dataAvailable: false` with every risk field `null` if current
+   *   conditions are themselves unavailable — same "missing an input, not
+   *   just lower-confidence" reasoning as the full path. Otherwise
+   *   `shortTermRisk` is freshly computed and `overallRisk` is derived from
+   *   the fresh short-term risk plus the cached long-term risk.
+   */
+  calculateShortTermRiskOnly(
+    current: CurrentConditionsProfile,
+    cached: CacheableLongTermRisk,
+  ): PoleViabilityScore {
+    if (!current.dataAvailable) {
+      this.logger.log(
+        `Short-term risk recompute unavailable for (${current.location.lat}, ${current.location.lng}): current.dataAvailable=false`,
+      );
+      return {
+        dataAvailable: false,
+        overallRisk: null,
+        shortTermRisk: null,
+        longTermRisk: null,
+      };
+    }
+
+    const conditions = current.conditions!;
+    const windAnomalyRisk = this.calculateWindAnomalyRisk(
+      conditions.windGustKmh ?? conditions.windSpeedKmh,
+      cached.meanWindSpeedKmh,
+    );
+    const freezeThawTransitionRisk = this.calculateFreezeThawTransitionRisk(
+      conditions.temperatureCelsius,
+      cached.soilWetnessRisk,
+    );
+    const shortTermRisk = clamp01(
+      windAnomalyRisk * 0.6 + freezeThawTransitionRisk * 0.4,
+    );
+    const overallRisk = clamp01(
+      cached.longTermRisk + shortTermRisk * SHORT_TERM_CONTRIBUTION_WEIGHT,
+    );
+
+    this.logger.log(
+      `Recomputed short-term risk for (${current.location.lat}, ${current.location.lng}) using cached longTermRisk=${cached.longTermRisk}: ` +
+        `${JSON.stringify({ shortTermRisk, overallRisk, windAnomalyRisk, freezeThawTransitionRisk })}`,
+    );
+
+    return {
       dataAvailable: true,
       overallRisk: roundTo2Decimals(overallRisk),
       shortTermRisk: roundTo2Decimals(shortTermRisk),
-      longTermRisk: roundTo2Decimals(longTermRisk),
+      longTermRisk: roundTo2Decimals(cached.longTermRisk),
     };
   }
 

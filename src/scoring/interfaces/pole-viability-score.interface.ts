@@ -25,6 +25,22 @@ export interface PoleViabilityScore {
 }
 
 /**
+ * The subset of a full computation's state needed to recompute
+ * `shortTermRisk` later without re-fetching soil or climate normals — what
+ * `ScoreCacheRepository` persists per location, and what
+ * `RiskScoringService.calculateShortTermRiskOnly` consumes on a cache hit.
+ * `longTermRisk` and `soilWetnessRisk` are full-precision (unrounded) here,
+ * unlike the rounded copy in `PoleViabilityScore`.
+ */
+export interface CacheableLongTermRisk {
+  longTermRisk: number;
+  /** Needed to recompute `freezeThawTransitionRisk` without re-fetching soil. */
+  soilWetnessRisk: number;
+  /** Needed to recompute `windAnomalyRisk` without re-fetching climate normals. */
+  meanWindSpeedKmh: number | null;
+}
+
+/**
  * The full-precision breakdown behind a `PoleViabilityScore` — every named
  * sub-score that fed `longTermRisk`/`shortTermRisk`/`overallRisk`. Logged
  * by `RiskScoringService` for observability/debugging, not returned from

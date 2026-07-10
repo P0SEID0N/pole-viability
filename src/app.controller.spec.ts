@@ -16,7 +16,9 @@ describe('AppController', () => {
 
   describe('root', () => {
     it('should return "Hello World!"', () => {
-      expect(appController.getHello()).toBe('Hello World!');
+      expect(appController.getHello()).toBe(
+        'Hello, to get viability data please use our /viability endpoint passing lat and lng as values. Thank you!',
+      );
     });
   });
 });

@@ -183,6 +183,21 @@ Real, documented physical failure mechanisms this formula does not model at all 
 - **Permafrost engineering** — for northern locations where `degreeDaysBelowZero`/`frostFreePeriodDays` already clamp to max risk (see External review above), real infrastructure there typically uses entirely different foundation techniques (piles, thermosyphons) specifically because seasonal freeze-thaw modeling doesn't apply the same way in perennially frozen ground. "Max freeze-thaw risk" under this formula is a different physical regime in the true north than in, say, Winnipeg.
 - **Wood decay/rot** — worth stating plainly: published estimates attribute roughly 60-85% of *actual* real-world wood pole failures to fungal core rot, not any site/climate/soil mechanism at all. This is a genuine, deliberate scope boundary (no per-pole age/material/species/inspection data exists to model it against) rather than an oversight — this tool estimates *site* risk, not overall failure probability, and the single largest real-world cause of pole failure is structurally outside what it can ever answer.
 
+## Score cache
+
+`ScoreCacheRepository` (`src/score-cache/`) persists one row per exact `(lat, lng)` in a SQLite file — the "very simple database" the user asked for. Chose SQLite via [`better-sqlite3`](https://www.npmjs.com/package/better-sqlite3) over anything heavier: synchronous (no async ceremony for what's a handful of tiny queries), file-based (no server process to run/manage), and it matches this project's existing pattern of small direct-SQL/direct-HTTP repository classes rather than pulling in an ORM.
+
+**Cache semantics** — a specific hybrid, not a plain read-through cache:
+- **Miss** (`findByLocation` returns nothing): fetch soil + climate normals + current conditions (all three, as before), compute the full score, and `upsertFullScore` it — unless `dataAvailable` is false, in which case there's nothing meaningful to cache and nothing is stored.
+- **Hit**: skip fetching soil and climate normals entirely (`SoilService`/`ClimateService.getClimateRiskProfile` are never called) and reuse the stored `longTermRisk` — genuinely stable, since it's derived from soil + 30-year climate normals. But **always** fetch live current conditions and recompute `shortTermRisk` fresh via `RiskScoringService.calculateShortTermRiskOnly` — a repeat query should never return day-old wind/temperature data. The row's `shortTermRisk`/`overallRisk`/`updatedAt` are updated afterward; `longTermRisk`/`computedAt` are left untouched.
+- This means the table holds each location's *most recent* computation only, not a history of every past one — "store all scores" was interpreted as "every computed score gets persisted/kept current," not as an append-only log.
+
+**Why `longTermRisk` alone isn't enough to cache**: `shortTermRisk`'s sub-calculations need more than just the cached number — `freezeThawTransitionRisk` needs `soilWetnessRisk` (a soil-derived intermediate) and `windAnomalyRisk` needs `meanWindSpeedKmh` (a climate-normals value). Both are persisted alongside `longTermRisk` in the cache row (`CacheableLongTermRisk` in `pole-viability-score.interface.ts`) specifically so a cache hit can recompute short-term risk correctly without re-fetching soil or climate normals just to get those two numbers back.
+
+**Config**: DB file defaults to `data/viability-scores.db` (gitignored, same pattern as `landscape_data/`), overridable via `SCORE_CACHE_DB_PATH`. Tests set this to `:memory:` — isolated per test run, no file left on disk, and no risk of one test's cached row silently changing another test's expected behavior (the e2e suite in particular always queries the same handful of coordinates, so without this a second `test:e2e` run would take the cache-hit path instead of cache-miss).
+
+**Verified**: live server, two requests to the same location — second request's log line read `Cache hit for (...) — reused longTermRisk, recomputed shortTermRisk`, and the SQLite row showed `computed_at` unchanged while `updated_at` advanced. New e2e test hits a location twice and asserts the mocked climate client's station/normals lookups were called exactly once (not twice) while current-conditions was called twice — proving the skip-on-hit behavior, not just trusting the log message.
+
 ## Open questions
 
 - **The formula's weights/thresholds are an unvalidated first draft.** Every constant in `risk-scoring.service.ts` is a documented, researched guess (see "Scoring formula" above), not fitted to real outcomes — there's no pole-failure data to calibrate against. Revisit once there's any real signal (even informal — known problem poles, utility company incident data) to check the formula's outputs against.
@@ -194,7 +209,7 @@ Real, documented physical failure mechanisms this formula does not model at all 
 - Should soil ingestion move to a real spatial database (e.g. PostGIS) once combined with climate data/if the dataset grows, or does in-memory-at-startup stay sufficient?
 - Does "city name" input require geocoding to lat/long first (and via what service)?
 - Does the formula distinguish telephone poles vs. electrical poles (different material, height, load standards)? Currently one formula for any pole type.
-- Any persistence needed (caching climate lookups so we're not re-hitting MSC GeoMet on every request — every `GET /viability` call currently makes 2-4 live HTTP calls to MSC GeoMet, storing formula versions/results), or is this fully stateless per-request?
+- **Persistence — partially resolved**: `longTermRisk` is now cached per location (see "Score cache" above), cutting a cache-hit request down to just a live current-conditions call. Still fully live/stateless: the initial cache-miss soil+climate-normals lookups, and every request's current-conditions fetch. Not yet addressed: cache invalidation (soil data never changes, but is 30-year climate normals ever revised, and would we know?), and no formula-version tracking on cached rows — if the formula changes, old cached `longTermRisk` values silently keep using whatever formula computed them.
 
 ## Development
 

@@ -38,6 +38,9 @@ lerna-debug.log*
 # SLC soil data (large binary GIS files, downloaded separately — see README.md)
 /landscape_data
 
+# Score cache (SQLite runtime data, regenerated automatically — see README.md)
+/data
+
 # dotenv environment variable files
 .env
 .env.development.local

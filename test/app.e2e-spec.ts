@@ -8,6 +8,9 @@ describe('AppController (e2e)', () => {
   let app: INestApplication<App>;
 
   beforeEach(async () => {
+    // In-memory score-cache DB — isolated per test run, no file left on disk.
+    process.env.SCORE_CACHE_DB_PATH = ':memory:';
+
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
     }).compile();
@@ -20,7 +23,9 @@ describe('AppController (e2e)', () => {
     return request(app.getHttpServer())
       .get('/')
       .expect(200)
-      .expect('Hello World!');
+      .expect(
+        'Hello, to get viability data please use our /viability endpoint passing lat and lng as values. Thank you!',
+      );
   });
 
   afterEach(async () => {

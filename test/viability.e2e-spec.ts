@@ -47,6 +47,10 @@ describe('ViabilityController (e2e)', () => {
   let app: INestApplication<App>;
 
   beforeAll(async () => {
+    // In-memory score-cache DB — isolated per test run, no file left on disk,
+    // and no risk of a later run silently hitting a cache row from an earlier one.
+    process.env.SCORE_CACHE_DB_PATH = ':memory:';
+
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
     })
@@ -89,6 +93,36 @@ describe('ViabilityController (e2e)', () => {
       // Rounded to 2 decimal places for display — the full-precision breakdown is logged, not returned.
       expect(value).toBe(Math.round(value! * 100) / 100);
     }
+  });
+
+  it('reuses longTermRisk from the cache on a repeat request, but still refreshes shortTermRisk', async () => {
+    const location = { lat: 51.0447, lng: -114.0719 }; // Calgary, AB — distinct from the golden-path test's location
+    mockMscGeometClient.findNearestNormalsStation.mockClear();
+    mockMscGeometClient.getAnnualNormals.mockClear();
+    mockMscGeometClient.findNearestCityConditions.mockClear();
+
+    const first = await request(app.getHttpServer())
+      .get('/viability')
+      .query(location)
+      .expect(200);
+    const second = await request(app.getHttpServer())
+      .get('/viability')
+      .query(location)
+      .expect(200);
+
+    // Cache miss then hit: soil/climate-normals resolution only happens once, but
+    // live current conditions are fetched fresh on every request either way.
+    expect(mockMscGeometClient.findNearestNormalsStation).toHaveBeenCalledTimes(
+      1,
+    );
+    expect(mockMscGeometClient.getAnnualNormals).toHaveBeenCalledTimes(1);
+    expect(mockMscGeometClient.findNearestCityConditions).toHaveBeenCalledTimes(
+      2,
+    );
+
+    const firstScore = first.body as PoleViabilityScore;
+    const secondScore = second.body as PoleViabilityScore;
+    expect(secondScore.longTermRisk).toBe(firstScore.longTermRisk);
   });
 
   it('rejects a request missing lat/lng with 400', async () => {
